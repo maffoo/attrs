@@ -712,6 +712,19 @@ class _ClassBuilder(object):
 
         return method
 
+    def add_evolve(self):
+        self._cls_dict['evolve'] = self._add_method_dunders(
+            _make_evolve(
+                self._attrs,
+                self._has_post_init,
+                self._frozen,
+                self._slots,
+                self._cache_hash,
+                self._base_attr_map,
+                self._is_exc,
+            )
+        )
+
 
 def attrs(
     maybe_cls=None,
@@ -729,6 +742,7 @@ def attrs(
     kw_only=False,
     cache_hash=False,
     auto_exc=False,
+    evolve_instance=False,
 ):
     r"""
     A class decorator that adds `dunder
@@ -934,6 +948,9 @@ def attrs(
                     "Invalid value for cache_hash.  To use hash caching,"
                     " init must be True."
                 )
+
+        if evolve_instance:
+            builder.add_evolve()
 
         return builder.build_class()
 
@@ -1294,6 +1311,52 @@ def _make_init(
     return __init__
 
 
+def _make_evolve(
+    attrs, post_init, frozen, slots, cache_hash, base_attr_map, is_exc
+):
+    def evolve(self, **changes):
+        import attr
+        return attr.evolve(self, **changes)
+
+    return evolve
+
+    attrs = [a for a in attrs if a.init or a.default is not NOTHING]
+
+    # We cache the generated evolve methods for the same kinds of attributes.
+    sha1 = hashlib.sha1()
+    sha1.update(repr(attrs).encode("utf-8"))
+    unique_filename = "<attrs generated evolve {0}>".format(sha1.hexdigest())
+
+    script, globs, annotations = _attrs_to_evolve_script(
+        attrs, frozen, slots, post_init, cache_hash, base_attr_map, is_exc
+    )
+    locs = {}
+    bytecode = compile(script, unique_filename, "exec")
+    attr_dict = dict((a.name, a) for a in attrs)
+    globs.update({"NOTHING": NOTHING, "attr_dict": attr_dict})
+
+    if frozen is True:
+        # Save the lookup overhead in evolve if we need to circumvent
+        # immutability.
+        globs["_cached_setattr"] = _obj_setattr
+
+    eval(bytecode, globs, locs)
+
+    # In order of debuggers like PDB being able to step through the code,
+    # we add a fake linecache entry.
+    linecache.cache[unique_filename] = (
+        len(script),
+        None,
+        script.splitlines(True),
+        unique_filename,
+    )
+
+    evolve = locs["evolve"]
+    evolve.__annotations__ = annotations
+
+    return evolve
+
+
 def fields(cls):
     """
     Return the tuple of ``attrs`` attributes for a class.
@@ -1652,6 +1715,290 @@ def __init__(self, {args}):
     {lines}
 """.format(
             args=args, lines="\n    ".join(lines) if lines else "pass"
+        ),
+        names_for_globals,
+        annotations,
+    )
+
+
+def _attrs_to_evolve_script(
+    attrs, frozen, slots, post_init, cache_hash, base_attr_map, is_exc
+):
+    """
+    Return a script of an evolve method for *attrs* and a dict of globals.
+
+    The globals are expected by the generated script.
+
+    If *frozen* is True, we cannot set the attributes directly so we use
+    a cached ``object.__setattr__``.
+    """
+    lines = []
+    any_slot_ancestors = any(
+        _is_slot_attr(a.name, base_attr_map) for a in attrs
+    )
+    if frozen is True:
+        if slots is True:
+            lines.append(
+                # Circumvent the __setattr__ descriptor to save one lookup per
+                # assignment.
+                # Note _setattr will be used again below if cache_hash is True
+                "_setattr = _cached_setattr.__get__(self, self.__class__)"
+            )
+
+            def fmt_setter(attr_name, value_var):
+                return "_setattr('%(attr_name)s', %(value_var)s)" % {
+                    "attr_name": attr_name,
+                    "value_var": value_var,
+                }
+
+            def fmt_setter_with_converter(attr_name, value_var):
+                conv_name = _init_converter_pat.format(attr_name)
+                return "_setattr('%(attr_name)s', %(conv)s(%(value_var)s))" % {
+                    "attr_name": attr_name,
+                    "value_var": value_var,
+                    "conv": conv_name,
+                }
+
+        else:
+            # Dict frozen classes assign directly to __dict__.
+            # But only if the attribute doesn't come from an ancestor slot
+            # class.
+            # Note _inst_dict will be used again below if cache_hash is True
+            lines.append("_inst_dict = self.__dict__")
+            if any_slot_ancestors:
+                lines.append(
+                    # Circumvent the __setattr__ descriptor to save one lookup
+                    # per assignment.
+                    "_setattr = _cached_setattr.__get__(self, self.__class__)"
+                )
+
+            def fmt_setter(attr_name, value_var):
+                if _is_slot_attr(attr_name, base_attr_map):
+                    res = "_setattr('%(attr_name)s', %(value_var)s)" % {
+                        "attr_name": attr_name,
+                        "value_var": value_var,
+                    }
+                else:
+                    res = "_inst_dict['%(attr_name)s'] = %(value_var)s" % {
+                        "attr_name": attr_name,
+                        "value_var": value_var,
+                    }
+                return res
+
+            def fmt_setter_with_converter(attr_name, value_var):
+                conv_name = _init_converter_pat.format(attr_name)
+                if _is_slot_attr(attr_name, base_attr_map):
+                    tmpl = "_setattr('%(attr_name)s', %(c)s(%(value_var)s))"
+                else:
+                    tmpl = "_inst_dict['%(attr_name)s'] = %(c)s(%(value_var)s)"
+                return tmpl % {
+                    "attr_name": attr_name,
+                    "value_var": value_var,
+                    "c": conv_name,
+                }
+
+    else:
+        # Not frozen.
+        def fmt_setter(attr_name, value):
+            return "self.%(attr_name)s = %(value)s" % {
+                "attr_name": attr_name,
+                "value": value,
+            }
+
+        def fmt_setter_with_converter(attr_name, value_var):
+            conv_name = _init_converter_pat.format(attr_name)
+            return "self.%(attr_name)s = %(conv)s(%(value_var)s)" % {
+                "attr_name": attr_name,
+                "value_var": value_var,
+                "conv": conv_name,
+            }
+
+    args = []
+    changes = []
+    kw_only_args = []
+    attrs_to_validate = []
+
+    # This is a dictionary of names to validator and converter callables.
+    # Injecting this into __init__ globals lets us avoid lookups.
+    names_for_globals = {}
+    annotations = {"return": None}
+
+    for a in attrs:
+        if a.validator:
+            attrs_to_validate.append(a)
+        attr_name = a.name
+        arg_name = a.name.lstrip("_")
+        has_factory = isinstance(a.default, Factory)
+        if has_factory and a.default.takes_self:
+            maybe_self = "self"
+        else:
+            maybe_self = ""
+        if a.init is False:
+            if has_factory:
+                init_factory_name = _init_factory_pat.format(a.name)
+                if a.converter is not None:
+                    lines.append(
+                        fmt_setter_with_converter(
+                            attr_name,
+                            init_factory_name + "({0})".format(maybe_self),
+                        )
+                    )
+                    conv_name = _init_converter_pat.format(a.name)
+                    names_for_globals[conv_name] = a.converter
+                else:
+                    lines.append(
+                        fmt_setter(
+                            attr_name,
+                            init_factory_name + "({0})".format(maybe_self),
+                        )
+                    )
+                names_for_globals[init_factory_name] = a.default.factory
+            else:
+                if a.converter is not None:
+                    lines.append(
+                        fmt_setter_with_converter(
+                            attr_name,
+                            "attr_dict['{attr_name}'].default".format(
+                                attr_name=attr_name
+                            ),
+                        )
+                    )
+                    conv_name = _init_converter_pat.format(a.name)
+                    names_for_globals[conv_name] = a.converter
+                else:
+                    lines.append(
+                        fmt_setter(
+                            attr_name,
+                            "attr_dict['{attr_name}'].default".format(
+                                attr_name=attr_name
+                            ),
+                        )
+                    )
+        elif a.default is not NOTHING and not has_factory:
+            arg = "{arg_name}=attr_dict['{attr_name}'].default".format(
+                arg_name=arg_name, attr_name=attr_name
+            )
+            if a.kw_only:
+                kw_only_args.append(arg)
+            else:
+                args.append(arg)
+            if a.converter is not None:
+                lines.append(fmt_setter_with_converter(attr_name, arg_name))
+                names_for_globals[
+                    _init_converter_pat.format(a.name)
+                ] = a.converter
+            else:
+                lines.append(fmt_setter(attr_name, arg_name))
+        elif has_factory:
+            arg = "{arg_name}=NOTHING".format(arg_name=arg_name)
+            if a.kw_only:
+                kw_only_args.append(arg)
+            else:
+                args.append(arg)
+            lines.append(
+                "if {arg_name} is not NOTHING:".format(arg_name=arg_name)
+            )
+            init_factory_name = _init_factory_pat.format(a.name)
+            if a.converter is not None:
+                lines.append(
+                    "    " + fmt_setter_with_converter(attr_name, arg_name)
+                )
+                lines.append("else:")
+                lines.append(
+                    "    "
+                    + fmt_setter_with_converter(
+                        attr_name,
+                        init_factory_name + "({0})".format(maybe_self),
+                    )
+                )
+                names_for_globals[
+                    _init_converter_pat.format(a.name)
+                ] = a.converter
+            else:
+                lines.append("    " + fmt_setter(attr_name, arg_name))
+                lines.append("else:")
+                lines.append(
+                    "    "
+                    + fmt_setter(
+                        attr_name,
+                        init_factory_name + "({0})".format(maybe_self),
+                    )
+                )
+            names_for_globals[init_factory_name] = a.default.factory
+        else:
+            if a.kw_only:
+                kw_only_args.append(arg_name)
+            else:
+                args.append(arg_name)
+            if a.converter is not None:
+                lines.append(fmt_setter_with_converter(attr_name, arg_name))
+                names_for_globals[
+                    _init_converter_pat.format(a.name)
+                ] = a.converter
+            else:
+                lines.append(fmt_setter(attr_name, arg_name))
+
+        if a.init is True and a.converter is None and a.type is not None:
+            annotations[arg_name] = a.type
+
+    if attrs_to_validate:  # we can skip this if there are no validators.
+        names_for_globals["_config"] = _config
+        lines.append("if _config._run_validators is True:")
+        for a in attrs_to_validate:
+            val_name = "__attr_validator_{}".format(a.name)
+            attr_name = "__attr_{}".format(a.name)
+            lines.append(
+                "    {}(self, {}, self.{})".format(val_name, attr_name, a.name)
+            )
+            names_for_globals[val_name] = a.validator
+            names_for_globals[attr_name] = a
+    if post_init:
+        lines.append("self.__attrs_post_init__()")
+
+    # because this is set only after __attrs_post_init is called, a crash
+    # will result if post-init tries to access the hash code.  This seemed
+    # preferable to setting this beforehand, in which case alteration to
+    # field values during post-init combined with post-init accessing the
+    # hash code would result in silent bugs.
+    if cache_hash:
+        if frozen:
+            if slots:
+                # if frozen and slots, then _setattr defined above
+                init_hash_cache = "_setattr('%s', %s)"
+            else:
+                # if frozen and not slots, then _inst_dict defined above
+                init_hash_cache = "_inst_dict['%s'] = %s"
+        else:
+            init_hash_cache = "self.%s = %s"
+        lines.append(init_hash_cache % (_hash_cache_field, "None"))
+
+    # For exceptions we rely on BaseException.__init__ for proper
+    # initialization.
+    if is_exc:
+        vals = ",".join("self." + a.name for a in attrs if a.init)
+
+        lines.append("BaseException.__init__(self, %s)" % (vals,))
+
+    args = ", ".join(args)
+    if kw_only_args:
+        if PY2:
+            raise PythonTooOldError(
+                "Keyword-only arguments only work on Python 3 and later."
+            )
+
+        args += "{leading_comma}*, {kw_only_args}".format(
+            leading_comma=", " if args else "",
+            kw_only_args=", ".join(kw_only_args),
+        )
+    return (
+        """\
+def evolve(self, {args}):
+    import attrs
+    return attrs.evolve(
+        self,{changes}
+    )
+""".format(
+            args=args, changes="\n            ".join(changes)
         ),
         names_for_globals,
         annotations,
